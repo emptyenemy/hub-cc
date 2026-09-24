@@ -60,7 +60,12 @@ const seenKeys = [];   // ключи, с которыми шлюз реальн�
 
 const upstream = http.createServer((req, res) => {
     const auth = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    seenKeys.push(auth);
+    // Считаем только запросы самого клиента. Каталог моделей (`GET /v1/models`) идёт
+    // тем же ключом и в ту же секунду, но к подмене аккаунта отношения не имеет: прокси
+    // дёргает его САМ, ещё старым ключом, пока ротация не доехала. В списке он выглядел
+    // лишней попыткой «пустым» ключом, и A краснел, хотя подмена отрабатывала верно
+    // (17.09: 403 → просьба к дашборду → повтор с новым ключом → 200).
+    if (String(req.url || '').startsWith('/v1/messages')) seenKeys.push(auth);
     req.resume();
     req.on('end', () => {
         if (emptyKeys.has(auth)) {
