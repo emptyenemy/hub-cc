@@ -1,6 +1,6 @@
 {
-  "default": "claude-opus-4-8",
-  "opus": "claude-opus-4-8",
-  "sonnet": "claude-opus-4-8",
+  "default": "claude-opus-5-thinking",
+  "opus": "claude-opus-5-thinking",
+  "sonnet": "claude-opus-5",
   "haiku": "claude-opus-4-8"
 }
