@@ -317,6 +317,101 @@ function stripFakeThinking(body, all) {
         return { body: Buffer.from(JSON.stringify(j), 'utf8'), cut };
     } catch (e) { return null; }
 }
+// ── Режим мышления, который нечем вернуть (2026-09-24) ───────────────────────
+// Бета `interleaved-thinking` требует блоки рассуждений ОБРАТНО, в последнем
+// ассистентском ходе. Клиент, который их вырезает (hermes:
+// agent/anthropic_message_convert.py — для сторонних эндпоинтов), присылает thinking
+// включённым, а в последнем ходе у него один tool_use — и шлюз отвечает 400
+// `The content[].thinking in the thinking mode must be passed back to the API`.
+// Сессия залипает навсегда: каждый следующий ход несёт ту же самую историю, и
+// «просто повторить» не лечит — лечится только форма запроса.
+// Замер 24.09 на живом теле крона (claude-sonnet-5, 3 хода): с бетой — 400,
+// без поля `thinking` — 200. Подделать блок нечем: он не наш и никем не подписан,
+// поэтому убираем сам режим — запрос становится консистентным.
+// 🪤 Гейт по БЕТЕ, а не «на всякий случай»: без неё та же форма проходит (замер
+// там же), и снятие режима молча лишило бы клиента рассуждений, которые он не
+// обязан возвращать. Рубильник — THINK_DROP=0.
+function dropUnreplayableThinking(body, beta) {
+    if (!/interleaved-thinking/i.test(String(beta || ''))) return null;
+    try {
+        const j = JSON.parse(body.toString('utf8') || '{}');
+        const th = j && j.thinking;
+        if (!th || typeof th !== 'object' || String(th.type || '') === 'disabled') return null;
+        if (!Array.isArray(j.messages)) return null;
+        let last = null;
+        for (let i = j.messages.length - 1; i >= 0; i--) {
+            if (j.messages[i] && j.messages[i].role === 'assistant') { last = j.messages[i]; break; }
+        }
+        if (!last) return null;
+        const blocks = Array.isArray(last.content) ? last.content : [];
+        if (blocks.some((b) => b && (b.type === 'thinking' || b.type === 'redacted_thinking'))) return null;
+        const mode = String(th.type || 'enabled');
+        delete j.thinking;
+        return { body: Buffer.from(JSON.stringify(j), 'utf8'), mode };
+    } catch (e) { return null; }
+}
+const THINK_DROP = String(process.env.THINK_DROP || '1') !== '0';
+
+// Включён ли режим мышления в теле, которое уходит наверх.
+// 🪤 Не разобрали тело — отвечаем `true`: заголовок трогаем только тогда, когда точно
+// знаем, что режима нет. Ошибка в эту сторону ничего не ломает (оставляем как было).
+function thinkingModeActive(buf) {
+    try {
+        const th = (JSON.parse((buf || Buffer.alloc(0)).toString('utf8') || '{}') || {}).thinking;
+        return !!(th && typeof th === 'object' && String(th.type || '') !== 'disabled');
+    } catch (e) { return true; }
+}
+
+// Убирает из anthropic-beta токен `interleaved-thinking*`, остальные оставляет как есть:
+// `fine-grained-tool-streaming` и прочие к рассуждениям не относятся.
+// Возвращает новое значение, '' если кроме него ничего не было, или null — менять нечего.
+function betaWithoutInterleavedThinking(value) {
+    const parts = String(value || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (!parts.length) return null;
+    const kept = parts.filter((p) => !/^interleaved-thinking/i.test(p));
+    if (kept.length === parts.length) return null;
+    return kept.join(',');
+}
+
+// ── Правки тела перед отправкой — в одном месте ───────────────────────────────
+// Иначе их теряет пересборка тела: фолбэк по пулу собирает его из `rawBody`, то есть
+// из ОРИГИНАЛА клиента, до всяких правок. 24.09 так вернулся `thinking` — уже на
+// deepseek-канал, где он же и уронил запрос 400 «must be passed back»: клиент получал
+// отказ на каждом ходу, а в логе рядом стояли «режим мышления снят» и
+// «отправлено: deepseek-v4-flash | {"thinking":{"type":"adaptive"…».
+// `tag` — префикс для лога (`POST /v1/messages` и пометка, если тело пересобрано).
+function healBody(buf, headers, tag) {
+    let out = buf;
+    if (THINK_DROP) {
+        const dropped = dropUnreplayableThinking(out, headers && headers['anthropic-beta']);
+        if (dropped) {
+            log(`${tag} режим мышления «${dropped.mode}» снят: в последнем ассистентском`
+              + ` ходе thinking-блоков нет, с этой бетой шлюз ответил бы 400`
+              + ` (${out.length}Б → ${dropped.body.length}Б)`);
+            out = dropped.body;
+            stats.remaps += 1;
+        }
+    }
+    // Не-chaude цель: если вернуть блок нечем, режим мышления снят (см. выше) — этого
+    // достаточно, чтобы КАЖДЫЙ запрос доходил. Чего НЕ хватает: канал AgentRouter для
+    // не-claude цели иногда отвечает `400 must be passed back` и на вылеченное тело
+    // (замер 24.09: то же тело проходит 6/6 раз, но крон-задача с claude-историей
+    // падает стабильно). Подставить пустой блок пробовали — канал его не принял:
+    // требует настоящий ПОДПИСАННЫЙ блок, а взять его неоткуда: hermes для сторонних
+    // эндпоинтов режет и безподписные блоки тоже. Опыт снят (см. историю 24.09).
+    // Остаток требует решения по архитектуре, а не ещё одной правки вслепую.
+    // Эдж AgentRouter (Aliyun WAF) режет запросы с фразами из блок-листа ответом 405
+    // с HTML-страницей, а не JSON-ошибкой; залипшая фраза остаётся в истории и валит
+    // каждый следующий ход сессии. Последняя текстовая правка перед отправкой.
+    try {
+        const san = wafSanitize(out);
+        if (san.hits || san.b64) {
+            log(`${tag} waf sanitize: ${san.hits} фраз(а), ${san.b64} base64-образ(ов) нейтрализовано`);
+            out = Buffer.from(san.text, 'utf8');
+        }
+    } catch (e) { /* санитайз — best-effort, тело шлём как есть при сбое */ }
+    return out;
+}
 // Текст отказа, ради которого всё это: его же ловит ветка лечения на 400.
 const SIG_ERR_RE = /Invalid\s+`?signature`?\s+in\s+`?thinking`?\s+block/i;
 // 🪤 Срезка image-блоков (была 11.09) СНЯТА 12.09 по прямой пробе зрения
@@ -607,6 +702,65 @@ function makeEmptyTextFilter() {
     },
   };
 }
+// ── Поддельная подпись thinking-блоков в ОТВЕТЕ (2026-09-24) ───────────────────
+// AgentRouter синтезирует thinking-блоки с подписью-заглушкой: это UUID, равный id
+// сообщения (замер 24.09 — `signature` и `id` в ответе совпадают). Клиент, который
+// знает, что у рассуждающей модели подписей Anthropic быть не может (hermes, ветка
+// is_deepseek: «unsigned blocks round-tripped but rejects signed ones»), такие блоки
+// выбрасывает — и на следующем ходу шлюз требует их обратно: `400 The content[].thinking
+// in the thinking mode must be passed back to the API`. Сессия залипает навсегда: каждый
+// следующий ход несёт ту же историю (24.09 крон «Уборка сессий» падал подряд).
+// Лечится на ОТВЕТНОЙ стороне: у не-claude цели отдаём блоки без подписи — клиент их
+// сохраняет, и требование шлюза исполнено. Тот же приём влит в agentrouter-proxy.js
+// (PR #7), но тот порт обслуживает AR-конвертер, а Hermes ходит через этот.
+// Claude-цели не трогаем: у них подписи настоящие, и по ним шлюз проверяет историю.
+function makeSignatureFilter() {
+  let buf = Buffer.alloc(0);
+  let hits = 0;
+  const SEP = Buffer.from('\n\n');
+  const one = (b) => { if (b && typeof b === 'object' && b.signature) { delete b.signature; hits += 1; } };
+  const handle = (ev) => {
+    const m = ev.match(/^data: (.*)$/m);
+    if (!m) return ev + '\n\n';
+    let obj;
+    try { obj = JSON.parse(m[1]); } catch (e) { return ev + '\n\n'; }
+    // Событие подписи само по себе лишнее: поле и так снимаем.
+    if (obj && obj.delta && obj.delta.type === 'signature_delta') { hits += 1; return ''; }
+    one(obj.content_block);
+    one(obj.delta);
+    if (Array.isArray(obj.content)) obj.content.forEach(one);
+    return ev.replace(/^data: .*$/m, 'data: ' + JSON.stringify(obj)) + '\n\n';
+  };
+  return {
+    get hits() { return hits; },
+    feed(chunk) {
+      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+      let out = '';
+      let pos;
+      while ((pos = buf.indexOf(SEP)) >= 0) {
+        const ev = buf.subarray(0, pos).toString('utf8');
+        buf = buf.subarray(pos + 2);
+        if (ev.length) out += handle(ev);
+      }
+      return Buffer.from(out, 'utf8');
+    },
+    end() {
+      const tail = buf.toString('utf8'); buf = Buffer.alloc(0);
+      return Buffer.from(tail, 'utf8');
+    },
+  };
+}
+// То же для не-стримового JSON-ответа: подпись убирается прямо в объекте.
+function stripResponseSignatures(raw) {
+  try {
+    const obj = JSON.parse(raw);
+    if (Array.isArray(obj.content)) {
+      for (const b of obj.content) { if (b && typeof b === 'object' && b.signature) delete b.signature; }
+    }
+    return JSON.stringify(obj);
+  } catch (e) { return raw; }
+}
+
 // Настоящее SSE-событие на границе событий: watchdog клиента считает только
 // реальные события (замер v1tusha), комментарий его НЕ сбрасывает.
 const PING = 'event: ping\ndata: {"type":"ping"}\n\n';
@@ -2178,6 +2332,12 @@ const server = http.createServer((req, res) => {
   // Фильтр пустого text-блока odyssey (см. makeEmptyTextFilter). Один на запрос, применяем
   // ПОСЛЕ model-echo к исходящим SSE-байтам. Гейт EMPTY_TEXT_FIX — только odyssey.
   const emptyTextFilter = EMPTY_TEXT_FIX ? makeEmptyTextFilter() : null;
+  // Срезка поддельной подписи thinking-блоков в ответе (см. makeSignatureFilter).
+  // Решаем ЛЕНИВО, по первой порции данных: к этому моменту цель запроса уже подменена
+  // тир-картой, и «claude» в теле клиента ничего не говорит о том, кому он поехал
+  // (24.09: клиент просил claude-sonnet-5, а запрос уходил на deepseek-v4-flash).
+  let sigFilter = null;                // null — ещё не решали; false — срезать нечего
+  const wantSigStrip = () => !/^claude/i.test(modelInBody(reqBody));
 
   const forward = (status, headers, stream) => {
     const isSSE = /text\/event-stream/i.test(String(headers['content-type'] || ''));
@@ -2203,8 +2363,10 @@ const server = http.createServer((req, res) => {
         stream.on('data', (chunk) => {
           const patched = patchSseChunk(chunk);
           if (patched === null) return;      // придержали до границы события (model-echo)
-          const out = emptyTextFilter ? emptyTextFilter.feed(patched) : patched;
+          let out = emptyTextFilter ? emptyTextFilter.feed(patched) : patched;
           if (!out.length) return;           // всё удержано фильтром пустого text-блока
+          if (sigFilter === null) sigFilter = wantSigStrip() ? makeSignatureFilter() : false;
+          if (sigFilter) { out = sigFilter.feed(out); if (!out.length) return; }
           if (!contentSent) { contentSent = true; clearEmptyGuard(); }
           armStall(stream);
           sentBytes += out.length;
@@ -2216,12 +2378,22 @@ const server = http.createServer((req, res) => {
         stream.on('end', () => {
           const rest = flushSseEcho();
           if (rest) {
-            const o = emptyTextFilter ? emptyTextFilter.feed(rest) : rest;
+            let o = emptyTextFilter ? emptyTextFilter.feed(rest) : rest;
+            if (sigFilter === null) sigFilter = wantSigStrip() ? makeSignatureFilter() : false;
+            if (sigFilter) o = sigFilter.feed(o);
             if (o.length) { res.write(o); noteStop(o); noteBytes(o); }
           }
           if (emptyTextFilter) {
             const f = emptyTextFilter.end();
             if (f.length) { res.write(f); noteStop(f); noteBytes(f); }
+          }
+          if (sigFilter) {
+            const f = sigFilter.end();
+            if (f.length) { res.write(f); noteStop(f); noteBytes(f); }
+            if (sigFilter.hits) {
+              log(`${req.method} ${reqPath} подпись thinking-блоков в ответе срезана`
+                + ` (${sigFilter.hits}) — клиент сохранит блоки и вернёт их на следующем ходу`);
+            }
           }
           stopTimer();
           noteTruncated();
@@ -2277,6 +2449,18 @@ const server = http.createServer((req, res) => {
           const patched = Buffer.from(rewriteModelJson(body.toString('utf8'), echoName), 'utf8');
           if (patched.length !== body.length) hdrs = Object.assign({}, hdrs, { 'content-length': String(patched.length) });
           body = patched;
+        }
+        // Подпись-подделка у не-claude цели — вон из ответа (см. makeSignatureFilter):
+        // клиент, который подписанные thinking-блоки выбрасывает, иначе залипнет на 400
+        // «must be passed back». Ставим после model-echo и длину пересчитываем так же.
+        if (!isCompressedBody(hdrs) && wantSigStrip() && /json/i.test(String(hdrs['content-type'] || ''))) {
+          const cleaned = Buffer.from(stripResponseSignatures(body.toString('utf8')), 'utf8');
+          if (cleaned.length !== body.length) {
+            hdrs = Object.assign({}, hdrs, { 'content-length': String(cleaned.length) });
+            log(`${req.method} ${reqPath} подпись thinking-блоков в ответе срезана`
+              + ` (${body.length}Б → ${cleaned.length}Б) — клиент сохранит блоки и вернёт их на следующем ходу`);
+          }
+          body = cleaned;
         }
         // 🪤 `content-length` и `transfer-encoding` вместе — невалидная пара (RFC 9112
         // §6.2), и HTTP-парсер Node роняет её как `HPE_INVALID_CONTENT_LENGTH`.
@@ -2336,8 +2520,10 @@ const server = http.createServer((req, res) => {
     stream.on('data', (chunk) => {
       const patched = patchSseChunk(chunk);
       if (patched === null) return;        // придержали до границы события (model-echo)
-      const out = emptyTextFilter ? emptyTextFilter.feed(patched) : patched;
+      let out = emptyTextFilter ? emptyTextFilter.feed(patched) : patched;
       if (!out.length) return;             // всё удержано фильтром пустого text-блока
+      if (sigFilter === null) sigFilter = wantSigStrip() ? makeSignatureFilter() : false;
+      if (sigFilter) { out = sigFilter.feed(out); if (!out.length) return; }
       if (!contentSent) { contentSent = true; clearEmptyGuard(); }
       armStall(stream);
       sentBytes += out.length;
@@ -2349,12 +2535,22 @@ const server = http.createServer((req, res) => {
     stream.on('end', () => {
       const rest = flushSseEcho();
       if (rest) {
-        const o = emptyTextFilter ? emptyTextFilter.feed(rest) : rest;
+        let o = emptyTextFilter ? emptyTextFilter.feed(rest) : rest;
+        if (sigFilter === null) sigFilter = wantSigStrip() ? makeSignatureFilter() : false;
+        if (sigFilter) o = sigFilter.feed(o);
         if (o.length) { res.write(o); noteStop(o); noteBytes(o); }
       }
       if (emptyTextFilter) {
         const f = emptyTextFilter.end();
         if (f.length) { res.write(f); noteStop(f); noteBytes(f); }
+      }
+      if (sigFilter) {
+        const f = sigFilter.end();
+        if (f.length) { res.write(f); noteStop(f); noteBytes(f); }
+        if (sigFilter.hits) {
+          log(`${req.method} ${reqPath} подпись thinking-блоков в ответе срезана`
+            + ` (${sigFilter.hits}) — клиент сохранит блоки и вернёт их на следующем ходу`);
+        }
       }
       stopTimer();
       noteTruncated();
@@ -2640,6 +2836,22 @@ const server = http.createServer((req, res) => {
     // из agentrouter-proxy.js: там та же защита, но для gpt-конвертера.
     for (const [k, v] of Object.entries(CC_FALLBACK_HEADERS)) {
       if (!headers[k]) headers[k] = v;
+    }
+    // 🪤 Бета `interleaved-thinking` включает строгость САМА, без поля `thinking` в теле:
+    // замер 24.09 на боевом теле крона — beta + `thinking` убрано → 400 «must be passed
+    // back», тот же запрос без беты → 200. Значит у клиента, который блоки рассуждений не
+    // возвращает (hermes их вырезает), снятия одного режима мало: в логе рядом стояли
+    // «режим мышления снят» и 400, и сессия залипала. Снимаем токен, когда режима в теле
+    // нет; остальные беты не трогаем.
+    if (!thinkingModeActive(body)) {
+      const cleaned = betaWithoutInterleavedThinking(headers['anthropic-beta']);
+      if (cleaned !== null) {
+        if (cleaned) headers['anthropic-beta'] = cleaned; else delete headers['anthropic-beta'];
+        if (attempt === 1) {
+          log(`${req.method} ${reqPath} из anthropic-beta снят interleaved-thinking:`
+            + ` режим мышления в теле не включён, с ним шлюз требует блоки обратно`);
+        }
+      }
     }
     // Активный ключ agentrouter из ar-active-key.txt (смена на лету): перекрываем
     // клиентский AUTH_TOKEN-заглушку реальным ключом из файла.
@@ -2931,7 +3143,12 @@ const server = http.createServer((req, res) => {
             forwardBuffered(buf, headers);
             return;
           }
-          reqBody = again.body;
+          // Тело пересобрано из rawBody — ОРИГИНАЛА клиента, до правок. Накладываем
+          // их заново: иначе вернётся снятый режим мышления и WAF-фразы, и повтор
+          // уйдёт на беспуловую модель с тем же `thinking` (24.09: ровно так запрос
+          // на deepseek-v4-flash умер 400 «must be passed back», а клиент получал
+          // отказ на каждом ходу, потому что в логе рядом стояло «режим мышления снят»).
+          reqBody = healBody(again.body, req.headers, `${req.method} ${reqPath} (после фолбэка)`);
           tgt = again;
           // Повтор не должен съедать бюджет попыток — он не ретрай, а уход из пула.
           bonusAttempts += 1;
@@ -3036,22 +3253,9 @@ const server = http.createServer((req, res) => {
         }
       }
     }
-    // 2026-09-22: эдж AgentRouter (Aliyun WAF) режет запросы с фразами из блок-листа
-    // ответом 405 "your request has been blocked" — HTML-страницей, не JSON-ошибкой.
-    // Раньше санитайз стоял ТОЛЬКО в agentrouter-proxy.js (OpenAI passthrough), а
-    // keepalive-proxy.js (этот порт, основной upstream для Hermes) его не звал —
-    // залипшая фраза оставалась в истории и валила КАЖДЫЙ следующий ход сессии
-    // (session 577eb2, wafSanitize ноль совпадений в grep до этой правки).
-    // Claude-модели тоже прогоняем: сигнатуры шлюза не зависят от модели-адресата.
-    // Идёт ПОСЛЕ срезки thinking-блоков: она меняет тело структурно, а санитайз —
-    // последняя текстовая правка перед отправкой.
-    try {
-      const san = wafSanitize(reqBody);
-      if (san.hits || san.b64) {
-        log(`waf sanitize (keepalive): ${san.hits} фраз(а), ${san.b64} base64-образ(ов) нейтрализовано`);
-        reqBody = Buffer.from(san.text, 'utf8');
-      }
-    } catch (e) { /* санитайз — best-effort, тело шлём как есть при сбое */ }
+    // Все правки тела — одной функцией (см. healBody): она же лечит тело после
+    // пересборки фолбэком по пулу, где эти правки иначе терялись.
+    reqBody = healBody(reqBody, req.headers, `${req.method} ${reqPath}`);
     // 🔬 11.09: снимок заголовков ПРЯМЫХ glm-запросов — на диск, рядом с дампами тел.
     // Разбор того дня упёрся в бисект хопов только потому, что снимка заголовков не
     // было: тело оказалось невиновно, а виноват content-length. Пишем и входящую
@@ -3976,10 +4180,83 @@ if (process.argv[2] === 'selftest') {
   assert.ok(!SIG_ERR_RE.test('Antilopay callback: invalid signature'),
     'чужое «invalid signature» (колбэк кассы) за наш класс не принимаем');
 
+  // ── Режим мышления, который нечем вернуть ────────────────────────────────────
+  // Форма боевого тела крона 24.09: thinking adaptive + бета interleaved-thinking +
+  // последний ассистентский ход с одним tool_use.
+  const INTERLEAVED = 'interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14';
+  const thinkBody = (lastBlocks, thinking) => Buffer.from(JSON.stringify({
+    model: 'claude-sonnet-5',
+    thinking: thinking === undefined ? { type: 'adaptive', display: 'summarized' } : thinking,
+    messages: [
+      { role: 'user', content: 'привет' },
+      { role: 'assistant', content: lastBlocks },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ок' }] },
+    ],
+  }), 'utf8');
+  const toolUse = [{ type: 'tool_use', id: 't1', name: 'terminal', input: {} }];
+
+  const healed = dropUnreplayableThinking(thinkBody(toolUse), INTERLEAVED);
+  assert.ok(healed && !JSON.parse(healed.body.toString('utf8')).thinking,
+    'блоков в последнем ходе нет — режим мышления обязан сняться, иначе шлюз ответит 400');
+  assert.strictEqual(healed.mode, 'adaptive', 'в лог едет снятый режим');
+  assert.strictEqual(dropUnreplayableThinking(thinkBody(toolUse), ''), null,
+    'без беты форма проходит — режим не трогаем, иначе молча лишим клиента рассуждений');
+  assert.strictEqual(dropUnreplayableThinking(
+    thinkBody([{ type: 'thinking', thinking: 'х', signature: 'x'.repeat(80) }, ...toolUse]), INTERLEAVED), null,
+    'блок есть — возвращать есть что, режим остаётся');
+  assert.strictEqual(dropUnreplayableThinking(thinkBody(toolUse, { type: 'disabled' }), INTERLEAVED), null,
+    'режим уже выключен — работы нет');
+  assert.strictEqual(dropUnreplayableThinking(Buffer.from('не json', 'utf8'), INTERLEAVED), null, 'не-JSON — null');
+
+  // Бета включает строгость сама: снимаем токен, когда режима в теле нет.
+  assert.strictEqual(
+    betaWithoutInterleavedThinking('interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14'),
+    'fine-grained-tool-streaming-2025-05-14', 'нашу бету снимаем, чужую оставляем');
+  assert.strictEqual(betaWithoutInterleavedThinking('fine-grained-tool-streaming-2025-05-14'), null,
+    'нашего токена нет — заголовок не переписываем');
+  assert.strictEqual(betaWithoutInterleavedThinking('interleaved-thinking-2025-05-14'), '',
+    'кроме нашего токена ничего не было — заголовок снимается целиком');
+  assert.strictEqual(thinkingModeActive(Buffer.from(JSON.stringify({ thinking: { type: 'adaptive' } }), 'utf8')), true,
+    'adaptive — режим включён');
+  assert.strictEqual(thinkingModeActive(Buffer.from(JSON.stringify({ thinking: { type: 'disabled' } }), 'utf8')), false,
+    'disabled — режим выключен, токен лишний');
+  assert.strictEqual(thinkingModeActive(Buffer.from(JSON.stringify({ messages: [] }), 'utf8')), false,
+    'поля нет — режим не включён');
+  assert.strictEqual(thinkingModeActive(Buffer.from('не json', 'utf8')), true,
+    'тело не разобрали — заголовок не трогаем');
+
+  // ── Срезка поддельной подписи в ответе ──────────────────────────────────────
+  const sf = makeSignatureFilter();
+  const sseIn = 'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+    + '"content_block":{"type":"thinking","thinking":"","signature":"uuid-заглушка"}}\n\n'
+    + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    + '"delta":{"type":"signature_delta","signature":"uuid"}}\n\n'
+    + 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n';
+  const sseOut = sf.feed(Buffer.from(sseIn, 'utf8')).toString('utf8') + sf.end().toString('utf8');
+  assert.ok(!/signature/.test(sseOut), 'подпись ушла из потока, включая событие signature_delta');
+  assert.ok(/content_block_stop/.test(sseOut), 'остальные события не тронуты');
+  assert.strictEqual(stripResponseSignatures('не json'), 'не json', 'не-JSON отдаём как есть');
+  assert.ok(!/"signature"/.test(stripResponseSignatures(
+    '{"content":[{"type":"thinking","thinking":"х","signature":"uuid"}]}')),
+    'в не-стримовом ответе подпись тоже снимается');
+
   // Сторож на проводку: обе точки должны стоять в коде, иначе функции живут зря.
   const thSrc = fs.readFileSync(__filename, 'utf8');
   assert.ok(/if \(THINK_STRIP\) \{[\s\S]{0,400}?if \(\/\^claude\[-_\]\/i\.test\(outModel2\)\) \{\s*\n\s*const th = stripFakeThinking\(reqBody, false\);/.test(thSrc),
     'упреждающая срезка не подключена к пути запроса либо потеряла гейт по цели');
+  assert.ok(/function healBody\(buf, headers, tag\)[\s\S]{0,700}?dropUnreplayableThinking\(out, headers && headers\['anthropic-beta'\]\)/.test(thSrc),
+    'правки тела не собраны в healBody либо снятие режима потеряло гейт по бете');
+  assert.ok(/reqBody = healBody\(reqBody, req\.headers,/.test(thSrc),
+    'healBody не подключён к обычному пути запроса');
+  assert.ok(/reqBody = healBody\(again\.body, req\.headers,/.test(thSrc),
+    'тело после фолбэка по пулу не лечится: снятый режим мышления и WAF-фразы вернутся в повтор');
+  assert.ok(/if \(!thinkingModeActive\(body\)\) \{[\s\S]{0,400}?betaWithoutInterleavedThinking\(headers\['anthropic-beta'\]\)/.test(thSrc),
+    'снятие токена interleaved-thinking не подключено к сборке заголовков апстрима');
+  assert.ok(/const wantSigStrip = \(\) => !\/\^claude\/i\.test\(modelInBody\(reqBody\)\)/.test(thSrc),
+    'срезка подписи не привязана к цели запроса (у claude подписи настоящие)');
+  assert.ok((thSrc.match(/sigFilter = wantSigStrip\(\) \? makeSignatureFilter\(\) : false/g) || []).length >= 2,
+    'срезка подписи подключена не ко всем путям потока');
+  assert.ok(/body = cleaned;/.test(thSrc), 'не-стримовый ответ подпись не чистит');
   assert.ok(/if \(!thinkStripTried && \/\^claude\[-_\]\/i\.test\(curModel\) && SIG_ERR_RE\.test\(buf\.toString\('utf8'\)\)\)/.test(thSrc),
     'лечение на 400 не подключено к ветке постоянных ошибок либо потеряло гейт по цели');
   // 🪤 Гейт по цели — не украшение. Проба сразу после первой выкатки (21.09, до правки)
