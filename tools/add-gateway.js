@@ -264,7 +264,13 @@ function checkAny(point, gw, files) {
     if (!fs.existsSync(abs)) return { status: 'missing', note: `нет файла ${rel}` };
 
     const hay = fs.readFileSync(abs, 'utf8');
-    const found = (point.any || []).some(v => hay.includes(subst(v, gw)));
+    // У `must-any` близость к маркеру считается так же, как у `must`: иначе у точки
+    // «список ручек ротации» (1.8m) хватило бы ЛЮБОГО `|bd|` в файле, в том числе из
+    // совсем другого списка — и пропуск в нужной строке прошёл бы зелёным.
+    const found = (point.any || []).some(v => {
+        const needle = subst(v, gw);
+        return point.within ? withinMarker(hay, subst(point.within, gw), needle) : hay.includes(needle);
+    });
     return found ? { status: 'ok' } : { status: 'missing', note: (point.any || []).map(v => subst(v, gw)).join('  |  ') };
 }
 
@@ -403,7 +409,7 @@ const C = process.stdout.isTTY
     ? { ok: '\x1b[32m', bad: '\x1b[31m', warn: '\x1b[33m', dim: '\x1b[2m', off: '\x1b[0m', b: '\x1b[1m' }
     : { ok: '', bad: '', warn: '', dim: '', off: '', b: '' };
 
-const FLAGS = ['github', 'ref', 'flatRate', 'anthropic'];
+const FLAGS = ['github', 'ref', 'flatRate', 'anthropic', 'pool', 'shareScript'];
 
 /** Конфиг шлюза или выход: без него и check, и plan печатают одно и то же. */
 function gwOrDie(name, config) {
@@ -757,11 +763,22 @@ function applyPoint(point, rule, src, dst, pairs, files) {
 
     // Идемпотентность: если результат уже на месте — не трогаем. Иначе повторный
     // прогон удвоил бы записи, а это ровно та порча, которую дорого искать глазами.
-    const targetNeedle = subst(Array.isArray(point.expect) ? point.expect[0] : point.expect, dst);
+    // 🪤 Иглу ищем ТАМ ЖЕ, где стоит маркер, у точек с `within`: у 2.20 игла `'bd',`
+    // живёт в файле ещё девять раз (другие списки вкладок), и глобальный `includes`
+    // объявил бы вставку сделанной, оставив `check` красным по этому же пункту.
+    // У `must-any` берём первый вариант `any`: `expect` там пуст, и `subst(undefined)`
+    // дал бы иглу «undefined», то есть точку, которая всегда «уже на месте».
+    const needleSrc = Array.isArray(point.expect) ? point.expect[0]
+        : (point.expect != null ? point.expect : (point.any || [])[0]);
+    const targetNeedle = needleSrc == null ? null : subst(needleSrc, dst);
+    const alreadyThere = (needle) => {
+        if (needle == null) return false;
+        return point.within ? withinMarker(hay, subst(point.within, dst), needle) : hay.includes(needle);
+    };
     if (!rule.mode || rule.mode === 'after') {
-        if (hay.includes(targetNeedle)) { p.status = 'done'; p.note = 'уже на месте'; return p; }
+        if (alreadyThere(targetNeedle)) { p.status = 'done'; p.note = 'уже на месте'; return p; }
     } else if (rule.mode === 'inline') {
-        if (hay.includes(subst(rule.add, dst))) { p.status = 'done'; p.note = 'уже на месте'; return p; }
+        if (alreadyThere(subst(rule.add, dst))) { p.status = 'done'; p.note = 'уже на месте'; return p; }
     }
 
     const ref = refFor(point, rule, src);
@@ -876,7 +893,18 @@ function runApply(name, spec, config, write) {
     const pairs = tokenPairs(src, dst);
     const files = specFiles(spec);
     const inserts = spec.inserts || {};
-    const items = spec.points.map(pt => applyPoint(pt, inserts[pt.id], src, dst, pairs, files));
+    // 🪤 Источник бывает ПОТОЧЕЧНЫЙ. Вся вкладка клонируется с эталона (kktoken), но
+    // машинерия автореги у эталона отсутствует вовсе — она есть у `aikeysapi`, и точка
+    // с `"source": "aikeysapi"` берёт регион оттуда. Пара «источник → цель» при этом
+    // строится своя: у ak свой префикс, свой хост и свой порт, и общие пары kktoken
+    // оставили бы в скопированном коде чужие имена.
+    const pairsFor = (srcCfg) => (srcCfg === src ? pairs : tokenPairs(srcCfg, dst));
+    const items = spec.points.map(pt => {
+        const ptSrc = pt.source ? config[pt.source] : src;
+        if (!ptSrc) { console.error(`точка ${pt.id}: нет конфига источника «${pt.source}»`); process.exit(2); }
+        if (pt.source && pt.source === name) { console.error(`точка ${pt.id}: источник и цель совпали`); process.exit(2); }
+        return applyPoint(pt, inserts[pt.id], ptSrc, dst, pairsFor(ptSrc), files);
+    });
 
     const tally = { insert: 0, done: 0, skip: 0, manual: 0, bad: 0 };
     for (const it of items) tally[it.status] += 1;

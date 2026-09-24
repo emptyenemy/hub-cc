@@ -57,6 +57,12 @@ $perPort = @{
   # the gateway answers 404 on every request.
   20161 = @{ UPSTREAM = 'https://kktoken.cc'; KEY_FILE = "$profileDir\.claude\kktoken-active-key.txt";
              MODELMAP_FILE = (Join-Path $dir 'kktoken-modelmap.json') }
+  20175 = @{ UPSTREAM = 'https://fxqidian.de5.net'; KEY_FILE = "$profileDir\.claude\fxqidian-active-key.txt";
+             MODELMAP_FILE = (Join-Path $dir 'fxqidian-modelmap.json') }
+  20174 = @{ UPSTREAM = 'https://lsapi.cloud'; KEY_FILE = "$profileDir\.claude\lsapi-active-key.txt";
+             MODELMAP_FILE = (Join-Path $dir 'lsapi-modelmap.json') }
+  20173 = @{ UPSTREAM = 'https://apichat.budsin.dev'; KEY_FILE = "$profileDir\.claude\budsin-active-key.txt";
+             MODELMAP_FILE = (Join-Path $dir 'budsin-modelmap.json') }
   # Nova (2026-09-17): panel Orbelis, New API. Bare root here too - keepalive appends
   # /v1/messages itself; nova.vcrauo.com/v1 would send /v1/v1/messages and answer 404.
   20172 = @{ UPSTREAM = 'https://nova.vcrauo.com'; KEY_FILE = "$profileDir\.claude\nova-active-key.txt";

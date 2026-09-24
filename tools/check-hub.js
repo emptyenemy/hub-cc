@@ -950,7 +950,7 @@ t('вкладки не зовут функций, которых нет: све�
     // `switchTab` зовёт такую функцию первой — открытие вкладки падает ReferenceError и
     // не доходит до конца, то есть пустая вкладка вместо содержимого.
     const src = read('routing/proxy-dashboard.html');
-    const PREF = '(?:ar|go|tb|xp|jw|sk|ts|kk|hn|ol)';
+    const PREF = '(?:ar|go|tb|xp|jw|sk|ts|kk|fx|ls|od|uk|bai|nv|bd|hn|ol)';
     const called = new Set([...src.matchAll(new RegExp('\\b(' + PREF + '[A-Z][A-Za-z0-9]*)\\s*\\(', 'g'))].map(m => m[1]));
     const defined = new Set();
     for (const re of [
@@ -995,7 +995,7 @@ t('дефолтный набор вкладок дашборда — как на
     // (генерация картинок/видео) и 'routes' (шпаргалка префиксного роутинга).
     // 12.09: добавилась 'aikeysapi' (AIKeysAPI/ZhiFlow, New API без GitHub-входа) —
     // сразу за 'hcnsec', рядом со своим поколением панели.
-    const want = ['fin', 'league', 'github', 'outlook', 'agentrouter', 'gorouter', 'justwoker', 'kktoken', 'nova', 'odyssey', 'bai', 'getunikey', 'aipm', 'hcnsec', 'aikeysapi', 'rumeng', 'tabi', 'custom', 'media', 'plugins', 'health', 'models', 'routes', 'settings'];
+    const want = ['fin', 'league', 'github', 'outlook', 'agentrouter', 'gorouter', 'justwoker', 'kktoken', 'fxqidian', 'lsapi', 'budsin', 'nova', 'odyssey', 'bai', 'getunikey', 'aipm', 'hcnsec', 'aikeysapi', 'rumeng', 'tabi', 'custom', 'media', 'plugins', 'health', 'models', 'routes', 'settings'];
     if (tabs.join(',') !== want.join(',')) return `набор разъехался: ${tabs.join(',')}`;
     return true;
 });
@@ -1369,6 +1369,26 @@ function macReady() {
     const notExec = idx.split('\n').filter(Boolean).filter(l => !l.startsWith('100755')).map(l => l.split('\t')[1]);
     notExec.length === 0 ? ok('точки входа для мака лежат в git с exec-битом')
         : bad('exec-бит в индексе', notExec.join(', ') + ' — двойной клик на маке упрётся в права');
+
+    // 🔴 Telegram-шаг установщика. 23.09.2026 обновление у друга «висело» именно тут:
+    // `ask` в авто-режиме отвечает «да» за человека, curl уходил за 70 МБ с telegram.org
+    // БЕЗ единого таймаута, файла на диске не появлялось - и на следующем обновлении всё
+    // повторялось. Поэтому две вещи обязаны быть правдой, и обе ломаются молча:
+    //   1. в авто-режиме (обновление) шаг не качает ничего сам - только говорит, что делать;
+    //   2. интерактивная закачка ограничена по времени и по скорости.
+    if (has('install-deps.sh')) {
+        const deps = read('install-deps.sh');
+        const at = deps.indexOf('tg_venv_ok &&');   // якорь - сам блок, а не определение функции выше
+        const tg = at < 0 ? '' : deps.slice(at, at + 3000);
+        const autoIdx = tg.indexOf('if [ "$AUTO" = "1" ]; then');
+        const askIdx = tg.indexOf('Портативного Telegram нет');
+        const noAutoDownload = autoIdx >= 0 && askIdx > autoIdx && /обновление его не качает/.test(tg);
+        const bounded = /curl -fL --connect-timeout \d+ --max-time \d+ --speed-limit \d+ --speed-time \d+/.test(tg);
+        noAutoDownload && bounded
+            ? ok('Telegram-шаг: в обновлении не качает, интерактивная закачка ограничена таймаутами')
+            : bad('Telegram-шаг установщика',
+                `авто-ветка до вопроса: ${noAutoDownload}, таймауты у curl: ${bounded}`);
+    }
 }
 
 // ── 14. Пачка нажатий не теряется ────────────────────────────────────────────

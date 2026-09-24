@@ -93,10 +93,33 @@ async function accountProxy({ host, profileDir = null, accountId = null, force =
 // Раньше это выглядело как «в профиле нет куки»: точный баланс молча деградировал в
 // прикидку, а причина не читалась ниоткуда — у пользователя на другой машине из всей
 // диагностики был только текст уведомления. Теперь ошибку загрузки помним и называем.
+//
+// 🪤 С 12.x помнить по `require` НЕЛЬЗЯ: биндинг там грузится лениво, внутри конструктора
+// (`node_modules/better-sqlite3/lib/database.js:48`), поэтому `require('better-sqlite3')`
+// отвечает успехом и на модуле без собранной нативной части. Замер 21.09 в изолированной
+// копии без бинарника: `require` - OK, падает только `new Database(':memory:')`
+// («Could not locate the bindings file»). Диагностика ниже писалась 18.08 уже под эту
+// версию и потому не срабатывала НИ РАЗУ: `SQLITE_ERROR` оставался null, отказ сборки молча
+// уходил в прикидку баланса (`guessGrant`), а `cookieFailReason` вместо «модуль не собран»
+// выдавал «войди в ЛК заново» или «ключ не расшифровался» - то есть уводил разбор туда, где
+// дефекта нет. Поэтому нативную часть пробуем здесь же, один раз на процесс.
 let SQLITE_ERROR = null;
+let SQLITE_BINDING_OK = false;      // проба прошла: конструктор реально поднимается
 function sqliteModule() {
-    try { return require('better-sqlite3'); }
-    catch (e) { SQLITE_ERROR = (e && (e.message || String(e))) || 'не загружается'; return null; }
+    try {
+        const Database = require('better-sqlite3');
+        if (!Database) return null;
+        if (!SQLITE_BINDING_OK) {
+            new Database(':memory:').close();   // ленивый биндинг поднимается только здесь
+            SQLITE_BINDING_OK = true;
+        }
+        SQLITE_ERROR = null;        // успех обнуляет отставший диагноз
+        return Database;
+    } catch (e) {
+        SQLITE_ERROR = (e && (e.message || String(e))) || 'не загружается';
+        SQLITE_BINDING_OK = false;
+        return null;
+    }
 }
 
 // Готовность бэкенда куки — для громкой строки в логе прокси при старте.
@@ -220,6 +243,15 @@ const HOST_AUTH = {
     // и точный баланс тихо падает в «угадать грант». Проверить ПЕРВЫМ живым логином:
     // цифра обязана прийти из /api/user/self, а не из guessGrant.
     'kktoken.cc': 'jwt',
+    'fxqidian.de5.net': 'jwt',
+    // lsapi.cloud — classic, замер 21.09 по ЖИВОМУ аккаунту (id 3520, регистрация авторегой).
+    // Инструмент вписал сюда `jwt` копией от kktoken, и это был бы тихий промах: ветка jwt
+    // ищет куку `new_api_refresh`, а панель её не отдаёт вовсе - в jar лежат только
+    // `theme_scale` и `session`. Проверено прямым запросом: `GET /api/user/self` с этой кукой
+    // и заголовком `New-Api-User: 3520` отвечает 200 и отдаёт quota. То есть цифра обязана
+    // идти из /api/user/self, а не из guessGrant.
+    'lsapi.cloud': 'classic',
+    'apichat.budsin.dev': 'jwt',
     'nova.vcrauo.com': 'jwt',
     // odysseyapi.tech — НЕ New-API вовсе: свой шлюз на Next.js, вход через Clerk
     // (`clerk.odysseyapi.tech`), публичных /api/user/* нет — `GET /api/status` отдаёт

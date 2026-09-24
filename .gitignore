@@ -437,6 +437,9 @@ kktoken/profiles/
 kktoken/sessions/
 kktoken/gh-sessions/
 routing/kktoken-sessions.json
+routing/fxqidian-sessions.json
+routing/lsapi-sessions.json
+routing/budsin-sessions.json
 routing/odyssey-sessions.json
 routing/bai-sessions.json
 
@@ -513,6 +516,10 @@ outlook/sessions/
 routing/league-config.json
 routing/league-data/
 routing/league-peers.json
+# Настройки графика, снятые с ноды (см. LEAGUE_CHART_FILE): состояние, а не код.
+routing/league-chart.json
+# Что хаб взял с ноды по расписанию наливки (см. LEAGUE_SCHED_FILE).
+routing/league-sched.json
 routing/league-e2e-key.json
 routing/archive/
 
@@ -593,10 +600,19 @@ routing/own-proxies.txt
 _research/probe-camoufox-proxy.py
 
 # Рабочие артефакты проб (16.09): вывод проб - не код.
-# 🪤 `odyssey/candidates.json` и `_research/probe-odyssey-candidates.json` под это правило
-# НЕ попадают намеренно: их уже отслеживает git (уехали в коммит `3247c46`), а правило
-# игнорирования на отслеживаемый файл не действует - такая строка выглядела бы рабочим
-# запретом, ничего не запрещая. Судьбу этих двух файлов решает владелец.
+# 🪤 До 23.09.2026 эти два файла НЕ были закрыты намеренно: git их уже отслеживал (коммит
+# `3247c46`), а правило игнорирования на отслеживаемый файл не действует - строка выглядела
+# бы рабочим запретом, ничего не запрещая, и судьбу файлов оставляли владельцу.
+# 🔴 Решение владельца 23.09.2026: снять с отслеживания и закрыть. Повод измерен: проба
+# `_research/probe-odyssey-candidates.js:229,232` пишет в оба файла свой пул адресов, и после
+# прогона 22.09 там оказались адреса СОБСТВЕННЫХ нод владельца (`tier: own`, нодовые инбаунды
+# `:10808`). В `HEAD` их нет ни в одном файле, но следующий `git add` опубликовал бы ровно тот
+# класс значений, который коммит `63fbc90` вычищал из публичного репо («опубликована цель для
+# сканирования и брутфорса, а на ноде fail2ban»). Сам страж этот класс не ловит: голый
+# `host:port` для него не секрет - поэтому правило добавлено и в `tools/check-no-secrets.js`.
+# Пути НЕ меняем: обёртка `odyssey/auto-add-loop.py` читает `odyssey/candidates.json` с диска.
+odyssey/candidates.json
+_research/probe-odyssey-candidates.json
 _research/*.out
 
 # Кэш провайдеров (ASN) для моста пула: пересоздаётся сам, знанием не является.
@@ -611,3 +627,23 @@ _research/ar-ip-cooldown-probe.txt
 _research/ar-ip-cooldown-probe.jsonl
 _research/ar-balances-sweep.txt
 _research/collect-gifts-progress.txt
+
+# ── BudsAI / budsin (вкладка дашборда): приватные данные ──────────────────────
+# Папки закрываем ДО первого прогона сессии: там профили браузера и живые куки
+# GitHub (budsin/gh-sessions/acct_*.json). Репозиторий публичный.
+# budsin-modelmap.json — безопасный конфиг маппинга, его коммитим.
+budsin/profiles/
+budsin/sessions/
+budsin/gh-sessions/
+
+# ── Fxqidian (fxqidian.de5.net) и Lingshu (lsapi.cloud): приватные данные ─────
+# Те же три папки, что у budsin выше, и по той же причине: профили браузера и живые
+# куки GitHub. Замер 22.09: у обоих шлюзов этих строк не было, а папки уже лежали на
+# диске (fxqidian/profiles 56 МБ, lsapi/profiles 44 МБ, плюс сессии) - то есть первый
+# же `git add -A` унёс бы их в публичный репозиторий.
+fxqidian/profiles/
+fxqidian/sessions/
+fxqidian/gh-sessions/
+lsapi/profiles/
+lsapi/sessions/
+lsapi/gh-sessions/

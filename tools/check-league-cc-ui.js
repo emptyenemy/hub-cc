@@ -48,7 +48,8 @@ if (A < 0 || B <= A) {
 const src = HTML.slice(A, B);
 const build = new Function('LG', 'LG_M', 'LG_TOT', 'LG_R', 'LG_RW', 'lgTok', 'lgSum', 'lgInt', 'lgCumOn',
     `${src}\nreturn { lgCc, lgCcRun, lgCcTotal, lgStreak, lgTotal, lgAligned, lgKeys, lgShow, lgMetricGap, lgComposition,
-             lgDef, lgDefMark, lgDefNote, lgRankable, lgPlace, lgSort, lgLegacyTotal, lgDefNotice };`);
+             lgDef, lgDefMark, lgDefNote, lgRankable, lgPlace, lgSort, lgLegacyTotal, lgDefNotice, lgRuns,
+             lgWindowKeys, lgCcOpen, lgTopCfg, lgTopRows };`);
 
 const LG_M = {
     cc: { lb: 'токены Claude Code', fmt: v => String(v), source: 'cc' },
@@ -107,14 +108,16 @@ ok('отсутствующий день остаётся дырой, а не н�
 // показывать нечего вовсе. Прежняя версия этого теста требовала прочерка у любого без
 // нового счётчика - это и была та поломка, из-за которой статистика старых версий не
 // отрисовывалась (владелец 18.09).
+// Место при этом даётся и прежнему (владелец 22.09: «номера нужны даже если версии не
+// соответствуют») - раньше на его месте стояла метка «~».
 ok('участник без нового счётчика не прячется за прочерком', () => {
     const row = stranger({ tot: { tokW: 5_000_000, tokA: 1_000_000, streak: 7 } });
     const a = api('cc', 'd7', { me: me({ ccStats: envelope() }), peers: [row] });
     assert.strictEqual(a.lgTotal(row, 'd7'), 5_000_000, 'показываем его собственную неделю');
     assert.strictEqual(a.lgShow(row, 'd7'), '5000000', 'и это цифра, а не прочерк');
     assert.strictEqual(a.lgDef(row), 'legacy');
-    assert.strictEqual(a.lgRankable(row), false, 'но в места он не идёт');
-    assert.strictEqual(a.lgPlace(row, 1), '~', 'вместо места - метка счётчика');
+    assert.strictEqual(a.lgRankable(row), false, 'сравнимым с каноническим он от этого не стал');
+    assert.strictEqual(a.lgPlace(row, 1), '2', 'но номер в списке получает: владелец 22.09');
     assert.strictEqual(a.lgMetricGap(row), null, 'причина «нет данных» тут не называется: данные есть');
 });
 
@@ -222,7 +225,9 @@ ok('метрика токенов в интерфейсе одна, прежне
 // ── Совместимость версий: у соседа на старом клиенте есть свои числа ──────────
 // Владелец 18.09: «статистика прошлых версий просто не отрисовывается». Участник, который
 // ещё не обновился, присылает прежние поля (`tok`, `tot.tok*`) - их и надо показать,
-// помечая другим счётчиком и не пуская в места: определения разные.
+// помечая другим счётчиком. С 22.09 такие участники ещё и получают место в списке
+// (владелец: «номера нужны даже если версии не соответствуют»), но остаются в хвосте
+// доски: сравнимое впереди, прежние между собой.
 
 ok('участник без нового счётчика показывает свою прежнюю цифру', () => {
     const a = api('cc', 'd7', {});
@@ -242,16 +247,23 @@ ok('прежняя цифра помечена и объяснена слова�
     assert.strictEqual(a.lgDefMark(me({ ccStats: envelope() })), '', 'у нового счётчика метки нет');
 });
 
-ok('в местах участвует только новый счётчик', () => {
+ok('место даётся всем, у кого есть цифры, а сравнимое идёт первым', () => {
     const a = api('cc', 'd7', {});
     const fresh = me({ ccStats: envelope({ totals: { d7: 1_000 } }) });
     const old = stranger();
+    const empty = { nick: 'пусто', tot: {} };
     assert.strictEqual(a.lgRankable(fresh), true);
-    assert.strictEqual(a.lgRankable(old), false, 'прежний в места не идёт');
+    assert.strictEqual(a.lgRankable(old), false, 'прежний с каноническим счётчиком несравним');
     assert.strictEqual(a.lgPlace(fresh, 0), '1', 'первое место у нового счётчика');
-    assert.strictEqual(a.lgPlace(old, 1), '~', 'у прежнего вместо места метка счётчика');
+    assert.strictEqual(a.lgPlace(old, 1), '2', 'прежний получает номер, а не метку: владелец 22.09');
+    assert.strictEqual(a.lgPlace(empty, 2), '—', 'а пустому номер не выдумывается');
     assert.ok(a.lgSort([old, fresh])[0] === fresh,
-        'первым идёт новый счётчик даже когда его цифра меньше');
+        'первым всё равно идёт сравнимый, даже когда его цифра меньше');
+    const notice = api('cc', 'd7', { me: me({ ccStats: envelope() }), peers: [old] }).lgDefNotice();
+    assert.ok(!/в местах не участвуют/i.test(notice),
+        'шапка больше не выключает прежних из мест: ' + notice);
+    assert.ok(!/в местах не участвует/i.test(a.lgDefNote(old)),
+        'и подсказка тоже: ' + a.lgDefNote(old));
 });
 
 ok('два прежних участника сортируются между собой по своей цифре', () => {
@@ -289,6 +301,117 @@ ok('определения не складываются и не подменя�
     assert.notStrictEqual(a.lgTotal(fresh, 'd7') + a.lgTotal(old, 'd7'), a.lgTotal(fresh, 'd7'),
         'суммы из двух определений не собираются');
     assert.ok(/прежний/i.test(a.lgDefNote(fresh)) === false, 'у нового участника пояснения про прежний счётчик нет');
+});
+
+// 🔴 Свежая установка 23.09.2026: график «всё время» у друга был пустым, а «за месяц» рисовался.
+// Причина в разбиении ряда на куски: кусок из ОДНОЙ точки отбрасывался (`filter(s => s.length > 1)`),
+// и вся серия не рисовалась вовсе - ни линии, ни точки, ни подписи. У «всё время» на свежей
+// машине день ровно один, у месяца ключей 30 - отсюда разница в поведении.
+ok('одиночная точка - это данные, а не пустой кусок', () => {
+    const a = api('cc', 'd7', {});
+    assert.deepStrictEqual(a.lgRuns([5]), [[0]], 'кусок из одной точки остаётся');
+    assert.deepStrictEqual(a.lgRuns([1, null, 2, 3]), [[0], [2, 3]],
+        'null рвёт ряд, но одиночный кусок перед разрывом не пропадает');
+    assert.deepStrictEqual(a.lgRuns([1, 2, 3]), [[0, 1, 2]], 'обычный ряд - один кусок');
+    assert.deepStrictEqual(a.lgRuns([]), [], 'пустой ряд - ни одного куска');
+    assert.deepStrictEqual(a.lgRuns([1, 2], 2), [[0, 1]], 'minLen=2 одиночку отсекает (пунктир налива)');
+    assert.deepStrictEqual(a.lgRuns([1, 2, null, 3], 2), [[0, 1]], 'и не склеивает куски через разрыв');
+});
+
+// 🔴 Свежая установка 23.09.2026, второй заход: график «всё время» у друга рисовался, но ось
+// была из ОДНОГО дня - его собственной истории. Соседи сжимались в один столбец (подписи
+// налезали, у соседа «за сутки» 1 М против 47 млрд за всё время), и доска отдавала первое
+// место свежей машине. Окно «всё время» обязано собираться из всех, кого рисуем.
+ok('ось «всё время» собирается из всех участников, а не из своей истории', () => {
+    const a = api('cc', 'all', {});
+    const mine = me({ ccStats: envelope() });                                    // дни 09-14…09-16
+    const peer = stranger({ ccStats: envelope({
+        days: { keys: ['2026-08-01', '2026-09-16'], values: [5, 6] } }) });
+    assert.deepStrictEqual(a.lgWindowKeys(mine, [mine, peer], 'all'),
+        ['2026-08-01', '2026-09-14', '2026-09-15', '2026-09-16'],
+        'объединение ключей всех участников, по возрастанию и без дублей');
+    assert.deepStrictEqual(a.lgWindowKeys(mine, [], 'all'), a.lgKeys(mine, 'all'),
+        'без соседей ось «всё время» - свои ключи');
+
+    // 🔴 Второй заход: неделя и месяц рисовались ОДНИМ столбцом, потому что ось бралась из
+    // своего ряда, а у канонического счётчика он у молодой машины короче окна («работают
+    // только сутки», друг 23.09.2026). У фиксированных окон ось общая и лежит в `me.keys`.
+    const weekKeys = ['2026-09-17', '2026-09-18', '2026-09-19', '2026-09-20', '2026-09-21', '2026-09-22', '2026-09-23'];
+    const young = me({ keys: { d7: weekKeys, d30: weekKeys, h24: ['2026-09-23T20'] },
+        ccStats: envelope({ days: { keys: ['2026-09-23'], values: [5] } }) });
+    assert.deepStrictEqual(a.lgWindowKeys(young, [peer], 'd7'), weekKeys,
+        'неделя берёт ось окна, а не свой один день');
+    assert.strictEqual(a.lgWindowKeys(young, [peer], 'd7').length, 7, 'и в оси все семь суток');
+    assert.deepStrictEqual(a.lgWindowKeys(mine, [peer], 'd30'), a.lgKeys(mine, 'd30'),
+        'без `keys` в строке - прежнее поведение (ряд участника)');
+});
+
+// 🔴 Свежая установка 23.09.2026, третье: у друга нет кэша Claude Code, поэтому общий итог
+// приходит пустым, а нижняя граница (`lifetimeLower`) есть. UI брал в этом случае цифру
+// ПРЕЖНЕГО счётчика - участник «на новом счётчике» показывал чужое определение (1 М против
+// 47 млрд) и при этом шёл первым, потому что считался сравнимым. Оба конца одной ошибки.
+ok('неполный итог нового счётчика: своя цифра, метка «≥» и вне сравнения', () => {
+    const a = api('cc', 'all', {});
+    const fresh = me({ nick: 'новичок', ccStats: envelope({ lifetime: null, lifetimeLower: 7_000_000, complete: false }) });
+    const full = me({ nick: 'старый', ccStats: envelope() });
+    const old = stranger({ nick: 'прежний' });
+
+    assert.strictEqual(a.lgCcOpen(fresh), true, 'итог неполный - это видно');
+    assert.strictEqual(a.lgTotal(fresh, 'all'), 7_000_000, 'цифра берётся из своего же счётчика, а не из прежнего');
+    assert.notStrictEqual(a.lgTotal(fresh, 'all'), a.lgLegacyTotal(fresh, 'all'), 'прежнее определение не подставлено');
+    assert.strictEqual(a.lgShow(fresh, 'all'), '≥ 7000000', 'и помечена как нижняя граница');
+    assert.strictEqual(a.lgRankable(fresh), false, 'в общий рейтинг не идёт: сравнивать нечего');
+    assert.strictEqual(a.lgTotal(fresh, 'd30'), 48_000_000_000, 'окна при этом считаются как обычно');
+
+    assert.strictEqual(a.lgCcOpen(full), false, 'у полного итога метки нет');
+    assert.strictEqual(a.lgShow(full, 'all'), '59000000000', 'и цифра без «≥»');
+    assert.strictEqual(a.lgRankable(full), true, 'полный итог - идёт в сравнение');
+    assert.strictEqual(a.lgRankable(old), false, 'прежний счётчик - в свою группу, как и раньше');
+
+    const rows = a.lgSort([fresh, full, old]);
+    assert.strictEqual(rows[0].nick, 'старый', 'сравниваемый впереди: у него итог полный');
+    assert.notStrictEqual(rows[0].nick, 'новичок', 'свежая машина больше не первая на доске');
+});
+
+// 🔴 Владелец 23.09.2026: «надо, чтобы настройки графика жили на ноде, чтобы у людей
+// независимо от последних обновлений график менялся». Значит значения приходят с сервера,
+// а клиент только исполняет - и обязан пережить и мусор в них, и свои границы.
+ok('линиями - лидеры (сколько скажет нода) и всегда смотрящий', () => {
+    const a = api('cc', 'd7', {});
+    const rows = [1, 2, 3, 4, 5, 6, 7].map(i => ({ nick: 'u' + i, isMe: i === 6 }));
+
+    assert.strictEqual(a.lgTopCfg({}).n, 5, 'по умолчанию пятёрка');
+    assert.strictEqual(a.lgTopCfg({}).self, true, 'и смотрящий включён');
+    assert.strictEqual(a.lgTopCfg({ top: 99 }).n, 12, 'потолок 12 - выше молча не пускаем');
+    assert.strictEqual(a.lgTopCfg({ top: 0 }).n, 1, 'снизу тоже граница');
+    assert.strictEqual(a.lgTopCfg({ top: 'мусор' }).n, 5, 'мусор - значения по умолчанию');
+    assert.strictEqual(a.lgTopCfg({ self: 'нет' }).self, true, 'строка вместо булева не выключает');
+
+    assert.deepStrictEqual(a.lgTopRows(rows, a.lgTopCfg({})).map(r => r.nick),
+        ['u1', 'u2', 'u3', 'u4', 'u5', 'u6'], 'пятёрка лидеров плюс смотрящий шестым');
+    assert.deepStrictEqual(a.lgTopRows(rows, a.lgTopCfg({ top: 3 })).map(r => r.nick),
+        ['u1', 'u2', 'u3', 'u6'], 'нода сказала три - рисуем три и себя');
+    assert.deepStrictEqual(a.lgTopRows(rows, a.lgTopCfg({ top: 3, self: false })).map(r => r.nick),
+        ['u1', 'u2', 'u3'], 'смотрящего можно выключить с ноды');
+    assert.deepStrictEqual(a.lgTopRows(rows, a.lgTopCfg({ top: 9 })).map(r => r.nick),
+        rows.map(r => r.nick), 'себя в лидерах дважды не рисуем');
+});
+
+
+// 🔴 Владелец 23.09.2026: «третье место, токены 0 - почему он тогда на третьем месте?»
+// Ярусы («сравнимые впереди, прежние следом») давали ровно это: ноль наверху, 2,06 млрд ниже.
+// Решение владельца: порядок ПО ЧИСЛУ во всей доске, метки счётчика остаются, кто без числа -
+// в конец. Тест держит именно это, а не механику ярусов.
+ok('порядок доски - по числу, а не по определению счётчика', () => {
+    const a = api('cc', 'd7', {});
+    const canon0 = me({ nick: 'канон-ноль', ccStats: envelope({ totals: { h24: 1, d7: 0, d30: 0 }, lifetime: 1 }) });
+    const legacyBig = stranger({ nick: 'прежний-миллиард', tot: { tokW: 2_060_000_000, tokA: 50_000_000 } });
+    const bare = { nick: 'без-числа', tot: {} };
+    assert.strictEqual(a.lgTotal(canon0, 'd7'), 0, 'у канонического честный ноль');
+    assert.strictEqual(a.lgTotal(legacyBig, 'd7'), 2_060_000_000, 'у прежнего - его число');
+    const rows = a.lgSort([canon0, legacyBig, bare]);
+    assert.deepStrictEqual(rows.map(r => r.nick), ['прежний-миллиард', 'канон-ноль', 'без-числа'],
+        'большее число выше, ноль ниже него, кто без числа - в конец');
 });
 
 finish();
