@@ -39,6 +39,7 @@ const net = require('net');
 const path = require('path');
 const { PassThrough } = require('stream');
 const evStore = require('./event-store.js');
+const { wafSanitize } = require('./lib/waf-sanitize.js');
 
 const PORT = Number(process.env.PORT || 8787);
 const UPSTREAM = process.env.UPSTREAM || 'https://agentrouter.org';
@@ -2925,6 +2926,20 @@ const server = http.createServer((req, res) => {
         if (stripped) { reqBody = stripped; stats.remaps += 1; }
       }
     } catch (e) { /* не-JSON тело — срезать нечего */ }
+    // 2026-09-22: эдж AgentRouter (Aliyun WAF) режет запросы с фразами из блок-листа
+    // ответом 405 "your request has been blocked" — HTML-страницей, не JSON-ошибкой.
+    // Раньше санитайз стоял ТОЛЬКО в agentrouter-proxy.js (OpenAI passthrough), а
+    // keepalive-proxy.js (этот порт, основной upstream для Hermes) его не звал —
+    // залипшая фраза оставалась в истории и валила КАЖДЫЙ следующий ход сессии
+    // (session 577eb2, wafSanitize ноль совпадений в grep до этой правки).
+    // Claude-модели тоже прогоняем: сигнатуры шлюза не зависят от модели-адресата.
+    try {
+      const san = wafSanitize(reqBody);
+      if (san.hits || san.b64) {
+        log(`waf sanitize (keepalive): ${san.hits} фраз(а), ${san.b64} base64-образ(ов) нейтрализовано`);
+        reqBody = Buffer.from(san.text, 'utf8');
+      }
+    } catch (e) { /* санитайз — best-effort, тело шлём как есть при сбое */ }
     // 🔬 11.09: снимок заголовков ПРЯМЫХ glm-запросов — на диск, рядом с дампами тел.
     // Разбор того дня упёрся в бисект хопов только потому, что снимка заголовков не
     // было: тело оказалось невиновно, а виноват content-length. Пишем и входящую
